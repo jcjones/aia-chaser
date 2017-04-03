@@ -24,6 +24,8 @@ import (
 	"github.com/jcjones/ct-sql/utils"
 )
 
+var timeout = time.Second * 10
+
 var rootsFile = flag.String("roots", "roots.pem", "Trusted root CAs in PEM format")
 var hostsFile = flag.String("hosts", "", "Hosts to test")
 
@@ -90,12 +92,12 @@ func decodeAIA(ext []byte) (string, error) {
 	return "", nil
 }
 
-type AiaOutcome int
+type AiaOutcome string
 
 const (
-	SuccessViaAiaFetch AiaOutcome = iota
-	Success
-	Failure
+	SuccessViaAiaFetch AiaOutcome = "OKviaAIA"
+	Success = "Success"
+	Failure = "Failure"
 )
 
 type TestResult struct {
@@ -117,6 +119,8 @@ func (self *AiaState) recordResult(result AiaOutcome) {
 			Result: result,
 			Weight: self.Weight,
 		}
+
+    // fmt.Printf("%s %s\n", self.Hostname, result)
 	})
 }
 
@@ -176,7 +180,7 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 	// fmt.Printf("Fetching AIA: %s\n", *aiaURL)
 
 	client := &http.Client{
-		Timeout: time.Second * 10,
+		Timeout: timeout,
 	}
 
 	response, err := client.Get(*aiaURL)
@@ -220,7 +224,7 @@ func (self *AiaState) checkAndTryAia(wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	dailer := &net.Dialer{
-		Timeout: time.Second * 10,
+		Timeout: timeout,
 	}
 
 	conn, err := tls.DialWithDialer(dailer, "tcp", fmt.Sprintf("%s:443", self.Hostname), &tls.Config{
