@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,8 @@ var timeout = time.Second * 10
 
 var rootsFile = flag.String("roots", "roots.pem", "Trusted root CAs in PEM format")
 var hostsFile = flag.String("hosts", "", "Hosts to test")
+var numThreads = flag.Int("threads", 8, "Number of threads per core to use")
+
 
 var authorityInfoAccess = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}
 var aiaOCSP = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1}
@@ -96,13 +99,15 @@ type AiaOutcome string
 
 const (
 	SuccessViaAiaFetch AiaOutcome = "OKviaAIA"
-	Success = "Success"
-	Failure = "Failure"
+	Success                       = "Success"
+	Failure                       = "Failure"
 )
 
 type TestResult struct {
-	Result AiaOutcome
-	Weight uint64
+	Result   AiaOutcome
+	Hostname string
+	Error    error
+	Weight   uint64
 }
 
 type AiaState struct {
@@ -113,14 +118,16 @@ type AiaState struct {
 	ResultOnce sync.Once
 }
 
-func (self *AiaState) recordResult(result AiaOutcome) {
+func (self *AiaState) recordResult(result AiaOutcome, err error) {
 	self.ResultOnce.Do(func() {
 		self.ResultChan <- &TestResult{
-			Result: result,
-			Weight: self.Weight,
+			Result:   result,
+			Weight:   self.Weight,
+			Hostname: self.Hostname,
+			Error:    err,
 		}
 
-    // fmt.Printf("%s %s\n", self.Hostname, result)
+		// fmt.Printf("%s %s\n", self.Hostname, result)
 	})
 }
 
@@ -131,7 +138,7 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 	for _, certAsn1 := range rawCerts {
 		cert, err := x509.ParseCertificate(certAsn1)
 		if err != nil {
-			self.recordResult(Failure)
+			self.recordResult(Failure, err)
 			return err
 		}
 		if endEntity == nil {
@@ -150,7 +157,7 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 
 	if err == nil {
 		// Didn't need AIA fetching, so we are done
-		self.recordResult(Success)
+		self.recordResult(Success, nil)
 		return nil
 	}
 
@@ -161,7 +168,7 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 		if ext.Id.Equal(authorityInfoAccess) {
 			url, err := decodeAIA(ext.Value)
 			if err != nil {
-				self.recordResult(Failure)
+				self.recordResult(Failure, err)
 				return err
 			}
 
@@ -172,8 +179,9 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 	}
 
 	if aiaURL == nil {
-		self.recordResult(Failure)
-		return fmt.Errorf("No AIA url, and previous error was %s", err)
+		err = fmt.Errorf("No AIA url, and previous error was %s", err)
+		self.recordResult(Failure, err)
+		return err
 	}
 
 	// Fetch AIA
@@ -185,20 +193,20 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 
 	response, err := client.Get(*aiaURL)
 	if err != nil {
-		self.recordResult(Failure)
+		self.recordResult(Failure, err)
 		return err
 	}
 
 	defer response.Body.Close()
 	certBytes, err := ioutil.ReadAll(response.Body)
 	if err != nil {
-		self.recordResult(Failure)
+		self.recordResult(Failure, err)
 		return err
 	}
 
 	fetchedCert, err := x509.ParseCertificate(certBytes)
 	if err != nil {
-		self.recordResult(Failure)
+		self.recordResult(Failure, err)
 		return err
 	}
 
@@ -212,11 +220,11 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 	// Return whether or not the verify was successful
 	if err == nil {
 		// fmt.Println("Success by AIA")
-		self.recordResult(SuccessViaAiaFetch)
+		self.recordResult(SuccessViaAiaFetch, nil)
 		return nil
 	}
 
-	self.recordResult(Failure)
+	self.recordResult(Failure, err)
 	return err
 }
 
@@ -231,10 +239,14 @@ func (self *AiaState) checkAndTryAia(wg *sync.WaitGroup) {
 		InsecureSkipVerify:    true,
 		VerifyPeerCertificate: self.checkCertificate,
 	})
+
 	if err == nil {
+		// Success would already be recorded
+		conn.OCSPResponse()
 		conn.Close()
 	} else {
-		self.recordResult(Failure)
+		// Make sure we record a failure if we got an error; the sync.Once will protect from dupes
+		self.recordResult(Failure, err)
 	}
 }
 
@@ -251,6 +263,8 @@ func aggregate(c <-chan *TestResult, quit chan<- bool, progressDisplay *utils.Pr
 	var successViaAia uint64
 	var successViaAiaW uint64
 
+	var results []*TestResult
+
 	for result := range c {
 		switch result.Result {
 		case Failure:
@@ -264,7 +278,14 @@ func aggregate(c <-chan *TestResult, quit chan<- bool, progressDisplay *utils.Pr
 			successViaAiaW += result.Weight
 		}
 
+		results = append(results, result)
 		progressDisplay.UpdateProgress("Checking AIA", 0, success+failure+successViaAia, endIdx)
+	}
+
+	for _, result := range results {
+		if result.Result != Success {
+			fmt.Printf("%s %d %s %s\n", result.Hostname, result.Weight, result.Result, result.Error)
+		}
 	}
 
 	totalCount := float64(success + failure + successViaAia)
@@ -276,6 +297,12 @@ func aggregate(c <-chan *TestResult, quit chan<- bool, progressDisplay *utils.Pr
 	fmt.Printf("Failure: %d (%f) W: %d (%f)\n", failure, float64(failure)/totalCount, failureW, float64(failureW)/totalWeight)
 
 	quit <- true
+}
+
+func processInput(inputChan <-chan *AiaState, wg *sync.WaitGroup) {
+	for state := range inputChan {
+		state.checkAndTryAia(wg)
+	}
 }
 
 func main() {
@@ -339,16 +366,20 @@ func main() {
 	go aggregate(resultChan, completeChan, progressDisplay, uint64(len(hosts)))
 
 	var workWg sync.WaitGroup
+	inputChan := make(chan *AiaState, 4)
+
+	for i := 0; i < *numThreads * runtime.NumCPU(); i++ {
+		go processInput(inputChan, &workWg)
+	}
+
 	for _, hostObj := range hosts {
-		aiaCheck := AiaState{
+		workWg.Add(1)
+		inputChan <- &AiaState{
 			Hostname:   hostObj.Hostname,
 			RootCAList: roots,
 			ResultChan: resultChan,
 			Weight:     hostObj.Weight,
 		}
-
-		workWg.Add(1)
-		go aiaCheck.checkAndTryAia(&workWg)
 	}
 
 	workWg.Wait()
