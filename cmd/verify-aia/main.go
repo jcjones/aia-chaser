@@ -5,23 +5,23 @@
 package main
 
 import (
-  "bufio"
-  "crypto/tls"
-  "crypto/x509"
-  "encoding/asn1"
-  "flag"
-  "fmt"
-  "io/ioutil"
-  "log"
-  "net"
-  "net/http"
-  "os"
-  "strconv"
-  "strings"
-  "sync"
-  "time"
+	"bufio"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/asn1"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 
-  "github.com/jcjones/ct-sql/utils"
+	"github.com/jcjones/ct-sql/utils"
 )
 
 var rootsFile = flag.String("roots", "roots.pem", "Trusted root CAs in PEM format")
@@ -32,327 +32,327 @@ var aiaOCSP = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1}
 var aiaIssuer = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 2}
 
 func decodeCert(cert *x509.Certificate) string {
-  return fmt.Sprintf("%+v %+v", cert.Subject, cert.Extensions)
+	return fmt.Sprintf("%+v %+v", cert.Subject, cert.Extensions)
 }
 
 func decodeAIA(ext []byte) (string, error) {
-  var seq asn1.RawValue
-  rest, err := asn1.Unmarshal(ext, &seq)
-  if err != nil {
-    return "", fmt.Errorf("Error unmarshaling %s", err)
-  } else if len(rest) != 0 {
-    return "", fmt.Errorf("x509: trailing data after X.509 extension")
-  }
+	var seq asn1.RawValue
+	rest, err := asn1.Unmarshal(ext, &seq)
+	if err != nil {
+		return "", fmt.Errorf("Error unmarshaling %s", err)
+	} else if len(rest) != 0 {
+		return "", fmt.Errorf("x509: trailing data after X.509 extension")
+	}
 
-  if !seq.IsCompound || seq.Tag != 16 || seq.Class != 0 {
-    return "", asn1.StructuralError{Msg: "bad SAN sequence"}
-  }
+	if !seq.IsCompound || seq.Tag != 16 || seq.Class != 0 {
+		return "", asn1.StructuralError{Msg: "bad SAN sequence"}
+	}
 
-  rest = seq.Bytes
+	rest = seq.Bytes
 
-  for ; len(rest) > 0; {
-    var inside asn1.RawValue
-    rest, err = asn1.Unmarshal(rest, &inside)
-    if err != nil {
-      return "", fmt.Errorf("Error unmarshaling %s", err)
-    }
+	for len(rest) > 0 {
+		var inside asn1.RawValue
+		rest, err = asn1.Unmarshal(rest, &inside)
+		if err != nil {
+			return "", fmt.Errorf("Error unmarshaling %s", err)
+		}
 
-    if !inside.IsCompound || inside.Tag != 16 || inside.Class != 0 {
-      return "", asn1.StructuralError{Msg: "bad SAN sequence"}
-    }
+		if !inside.IsCompound || inside.Tag != 16 || inside.Class != 0 {
+			return "", asn1.StructuralError{Msg: "bad SAN sequence"}
+		}
 
-    var oidValue asn1.ObjectIdentifier
-    body, err := asn1.Unmarshal(inside.Bytes, &oidValue)
-    if err != nil {
-      return "", fmt.Errorf("Error unmarshaling %s", err)
-    }
+		var oidValue asn1.ObjectIdentifier
+		body, err := asn1.Unmarshal(inside.Bytes, &oidValue)
+		if err != nil {
+			return "", fmt.Errorf("Error unmarshaling %s", err)
+		}
 
-    var extensionData asn1.RawValue
-    rest, err := asn1.Unmarshal(body, &extensionData)
-    if err != nil {
-      return "", fmt.Errorf("Error unmarshaling %s", err)
-    } else if len(rest) != 0 {
-      return "", fmt.Errorf("x509: trailing data after AIA extension")
-    }
+		var extensionData asn1.RawValue
+		rest, err := asn1.Unmarshal(body, &extensionData)
+		if err != nil {
+			return "", fmt.Errorf("Error unmarshaling %s", err)
+		} else if len(rest) != 0 {
+			return "", fmt.Errorf("x509: trailing data after AIA extension")
+		}
 
-    if oidValue.Equal(aiaIssuer) {
-      switch extensionData.Tag {
-        case 6:
-          return string(extensionData.Bytes), nil
-        default:
-          return "", fmt.Errorf("Unknown type for AIA Issuer extension: %+v", extensionData)
-      }
-    }
+		if oidValue.Equal(aiaIssuer) {
+			switch extensionData.Tag {
+			case 6:
+				return string(extensionData.Bytes), nil
+			default:
+				return "", fmt.Errorf("Unknown type for AIA Issuer extension: %+v", extensionData)
+			}
+		}
 
-  }
+	}
 
-  // No AIA Issuer extension values
-  return "", nil
+	// No AIA Issuer extension values
+	return "", nil
 }
 
 type AiaOutcome int
+
 const (
-  SuccessViaAiaFetch AiaOutcome = iota
-  Success
-  Failure
+	SuccessViaAiaFetch AiaOutcome = iota
+	Success
+	Failure
 )
 
 type TestResult struct {
-  Result AiaOutcome
-  Weight uint64
+	Result AiaOutcome
+	Weight uint64
 }
 
 type AiaState struct {
-  Hostname string
-  RootCAList *x509.CertPool
-  Weight uint64
-  ResultChan chan<- *TestResult
-  ResultOnce sync.Once
+	Hostname   string
+	RootCAList *x509.CertPool
+	Weight     uint64
+	ResultChan chan<- *TestResult
+	ResultOnce sync.Once
 }
 
 func (self *AiaState) recordResult(result AiaOutcome) {
-  self.ResultOnce.Do(func(){
-    self.ResultChan <- &TestResult{
-      Result: result,
-      Weight: self.Weight,
-    }
-  })
+	self.ResultOnce.Do(func() {
+		self.ResultChan <- &TestResult{
+			Result: result,
+			Weight: self.Weight,
+		}
+	})
 }
 
 func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-  var endEntity *x509.Certificate
-  intermediates := x509.NewCertPool()
+	var endEntity *x509.Certificate
+	intermediates := x509.NewCertPool()
 
-  for _, certAsn1 := range rawCerts {
-    cert, err := x509.ParseCertificate(certAsn1)
-    if err != nil {
-      self.recordResult(Failure)
-      return err
-    }
-    if endEntity == nil {
-      endEntity = cert
-    } else {
-      intermediates.AddCert(cert)
-    }
-  }
+	for _, certAsn1 := range rawCerts {
+		cert, err := x509.ParseCertificate(certAsn1)
+		if err != nil {
+			self.recordResult(Failure)
+			return err
+		}
+		if endEntity == nil {
+			endEntity = cert
+		} else {
+			intermediates.AddCert(cert)
+		}
+	}
 
-  // Is this certList complete?
-  _, err := endEntity.Verify(x509.VerifyOptions{
-    DNSName: self.Hostname,
-    Intermediates: intermediates,
-    Roots:   self.RootCAList,
-  })
+	// Is this certList complete?
+	_, err := endEntity.Verify(x509.VerifyOptions{
+		DNSName:       self.Hostname,
+		Intermediates: intermediates,
+		Roots:         self.RootCAList,
+	})
 
-  if err == nil {
-    // Didn't need AIA fetching, so we are done
-    self.recordResult(Success)
-    return nil
-  }
+	if err == nil {
+		// Didn't need AIA fetching, so we are done
+		self.recordResult(Success)
+		return nil
+	}
 
-  // If not, let's find an AIA extension
-  var aiaURL *string
+	// If not, let's find an AIA extension
+	var aiaURL *string
 
-  for _, ext := range endEntity.Extensions {
-    if ext.Id.Equal(authorityInfoAccess) {
-      url, err := decodeAIA(ext.Value)
-      if err != nil {
-        self.recordResult(Failure)
-        return err
-      }
+	for _, ext := range endEntity.Extensions {
+		if ext.Id.Equal(authorityInfoAccess) {
+			url, err := decodeAIA(ext.Value)
+			if err != nil {
+				self.recordResult(Failure)
+				return err
+			}
 
-      if len(url) > 0 {
-        aiaURL = &url
-      }
-    }
-  }
+			if len(url) > 0 {
+				aiaURL = &url
+			}
+		}
+	}
 
-  if aiaURL == nil {
-    self.recordResult(Failure)
-    return fmt.Errorf("No AIA url, and previous error was %s", err)
-  }
+	if aiaURL == nil {
+		self.recordResult(Failure)
+		return fmt.Errorf("No AIA url, and previous error was %s", err)
+	}
 
-  // Fetch AIA
-  // fmt.Printf("Fetching AIA: %s\n", *aiaURL)
+	// Fetch AIA
+	// fmt.Printf("Fetching AIA: %s\n", *aiaURL)
 
-  client := &http.Client{
-    Timeout: time.Second * 10,
-  }
+	client := &http.Client{
+		Timeout: time.Second * 10,
+	}
 
-  response, err := client.Get(*aiaURL)
-  if err != nil {
-    self.recordResult(Failure)
-    return err
-  }
+	response, err := client.Get(*aiaURL)
+	if err != nil {
+		self.recordResult(Failure)
+		return err
+	}
 
-  defer response.Body.Close()
-  certBytes, err := ioutil.ReadAll(response.Body)
-  if err != nil {
-    self.recordResult(Failure)
-    return err
-  }
+	defer response.Body.Close()
+	certBytes, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		self.recordResult(Failure)
+		return err
+	}
 
-  fetchedCert, err := x509.ParseCertificate(certBytes)
-  if err != nil {
-    self.recordResult(Failure)
-    return err
-  }
+	fetchedCert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		self.recordResult(Failure)
+		return err
+	}
 
-  intermediates.AddCert(fetchedCert)
-  _, err = endEntity.Verify(x509.VerifyOptions{
-    DNSName: self.Hostname,
-    Intermediates: intermediates,
-    Roots:   self.RootCAList,
-  })
+	intermediates.AddCert(fetchedCert)
+	_, err = endEntity.Verify(x509.VerifyOptions{
+		DNSName:       self.Hostname,
+		Intermediates: intermediates,
+		Roots:         self.RootCAList,
+	})
 
-  // Return whether or not the verify was successful
-  if err == nil {
-    // fmt.Println("Success by AIA")
-    self.recordResult(SuccessViaAiaFetch)
-    return nil
-  }
+	// Return whether or not the verify was successful
+	if err == nil {
+		// fmt.Println("Success by AIA")
+		self.recordResult(SuccessViaAiaFetch)
+		return nil
+	}
 
-  self.recordResult(Failure)
-  return err
+	self.recordResult(Failure)
+	return err
 }
 
 func (self *AiaState) checkAndTryAia(wg *sync.WaitGroup) {
-  defer wg.Done()
+	defer wg.Done()
 
-  dailer := &net.Dialer{
-    Timeout: time.Second * 10,
-  }
+	dailer := &net.Dialer{
+		Timeout: time.Second * 10,
+	}
 
-  conn, err := tls.DialWithDialer(dailer, "tcp", fmt.Sprintf("%s:443", self.Hostname), &tls.Config{
-    InsecureSkipVerify: true,
-    VerifyPeerCertificate: self.checkCertificate,
-  })
-  if err == nil {
-    conn.Close()
-  } else {
-    self.recordResult(Failure)
-  }
+	conn, err := tls.DialWithDialer(dailer, "tcp", fmt.Sprintf("%s:443", self.Hostname), &tls.Config{
+		InsecureSkipVerify:    true,
+		VerifyPeerCertificate: self.checkCertificate,
+	})
+	if err == nil {
+		conn.Close()
+	} else {
+		self.recordResult(Failure)
+	}
 }
 
 type CheckHost struct {
-  Hostname string
-  Weight uint64
+	Hostname string
+	Weight   uint64
 }
 
 func aggregate(c <-chan *TestResult, quit chan<- bool, progressDisplay *utils.ProgressDisplay, endIdx uint64) {
-  var success uint64
-  var successW uint64
-  var failure uint64
-  var failureW uint64
-  var successViaAia uint64
-  var successViaAiaW uint64
+	var success uint64
+	var successW uint64
+	var failure uint64
+	var failureW uint64
+	var successViaAia uint64
+	var successViaAiaW uint64
 
-  for result := range c {
-    switch result.Result {
-    case Failure:
-      failure += 1
-      failureW += result.Weight
-    case Success:
-      success += 1
-      successW += result.Weight
-    case SuccessViaAiaFetch:
-      successViaAia += 1
-      successViaAiaW += result.Weight
-    }
+	for result := range c {
+		switch result.Result {
+		case Failure:
+			failure += 1
+			failureW += result.Weight
+		case Success:
+			success += 1
+			successW += result.Weight
+		case SuccessViaAiaFetch:
+			successViaAia += 1
+			successViaAiaW += result.Weight
+		}
 
-    progressDisplay.UpdateProgress("Checking AIA", 0, success + failure + successViaAia, endIdx)
-  }
+		progressDisplay.UpdateProgress("Checking AIA", 0, success+failure+successViaAia, endIdx)
+	}
 
-  totalCount := float64(success + failure + successViaAia)
-  totalWeight := float64(successW + failureW + successViaAiaW)
+	totalCount := float64(success + failure + successViaAia)
+	totalWeight := float64(successW + failureW + successViaAiaW)
 
-  fmt.Println("Results:\n\n")
-  fmt.Printf("Success: %d (%f) W: %d (%f)\n", success, float64(success)/totalCount, successW, float64(successW)/totalWeight)
-  fmt.Printf("Success Via AIA: %d (%f) W: %d (%f)\n", successViaAia, float64(successViaAia)/totalCount, successViaAiaW, float64(successViaAiaW)/totalWeight)
-  fmt.Printf("Failure: %d (%f) W: %d (%f)\n", failure, float64(failure)/totalCount, failureW, float64(failureW)/totalWeight)
+	fmt.Println("Results:\n\n")
+	fmt.Printf("Success: %d (%f) W: %d (%f)\n", success, float64(success)/totalCount, successW, float64(successW)/totalWeight)
+	fmt.Printf("Success Via AIA: %d (%f) W: %d (%f)\n", successViaAia, float64(successViaAia)/totalCount, successViaAiaW, float64(successViaAiaW)/totalWeight)
+	fmt.Printf("Failure: %d (%f) W: %d (%f)\n", failure, float64(failure)/totalCount, failureW, float64(failureW)/totalWeight)
 
-  quit <- true
+	quit <- true
 }
 
 func main() {
-  flag.Parse()
+	flag.Parse()
 
-  var hosts []*CheckHost
-  if (flag.NArg() == 1) {
-    hosts = append(hosts, &CheckHost{
-      Hostname: flag.Arg(0),
-      Weight: 1,
-    })
-  }
+	var hosts []*CheckHost
+	if flag.NArg() == 1 {
+		hosts = append(hosts, &CheckHost{
+			Hostname: flag.Arg(0),
+			Weight:   1,
+		})
+	}
 
-  if (len(*hostsFile) > 0) {
-    f, err := os.Open(*hostsFile)
-    if err != nil {
-      log.Fatalf("Could not open hosts file: %s", err)
-      return
-    }
+	if len(*hostsFile) > 0 {
+		f, err := os.Open(*hostsFile)
+		if err != nil {
+			log.Fatalf("Could not open hosts file: %s", err)
+			return
+		}
 
-    scanner := bufio.NewScanner(f)
-    for scanner.Scan() {
-      parts := strings.Split(scanner.Text(), " ")
-      weight, err := strconv.ParseUint(parts[1], 10, 64)
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			parts := strings.Split(scanner.Text(), " ")
+			weight, err := strconv.ParseUint(parts[1], 10, 64)
 
-      if err != nil {
-        log.Printf("Error: Could not parse number of input line %v: %s\n", parts, err)
-        continue
-      }
+			if err != nil {
+				log.Printf("Error: Could not parse number of input line %v: %s\n", parts, err)
+				continue
+			}
 
-      hosts = append(hosts, &CheckHost{
-        Hostname: parts[0],
-        Weight: weight,
-      })
+			hosts = append(hosts, &CheckHost{
+				Hostname: parts[0],
+				Weight:   weight,
+			})
 
-    }
-  }
+		}
+	}
 
-  if len(hosts) < 1 {
-    log.Fatalf("You must specify the host either as the last argument, or via -hosts")
-    return
-  }
+	if len(hosts) < 1 {
+		log.Fatalf("You must specify the host either as the last argument, or via -hosts")
+		return
+	}
 
-  roots := x509.NewCertPool()
-  rootsPEM, err := ioutil.ReadFile(*rootsFile)
-  if err != nil {
-    panic(err)
-  }
+	roots := x509.NewCertPool()
+	rootsPEM, err := ioutil.ReadFile(*rootsFile)
+	if err != nil {
+		panic(err)
+	}
 
-  ok := roots.AppendCertsFromPEM([]byte(rootsPEM))
-  if !ok {
-    panic("Could not load root CAs from " + *rootsFile)
-  }
+	ok := roots.AppendCertsFromPEM([]byte(rootsPEM))
+	if !ok {
+		panic("Could not load root CAs from " + *rootsFile)
+	}
 
+	var progWg sync.WaitGroup
+	progressDisplay := utils.NewProgressDisplay()
+	progressDisplay.StartDisplay(&progWg)
 
-  var progWg sync.WaitGroup
-  progressDisplay := utils.NewProgressDisplay()
-  progressDisplay.StartDisplay(&progWg)
+	completeChan := make(chan bool)
+	resultChan := make(chan *TestResult, 4)
+	go aggregate(resultChan, completeChan, progressDisplay, uint64(len(hosts)))
 
-  completeChan := make(chan bool)
-  resultChan := make(chan *TestResult, 4)
-  go aggregate(resultChan, completeChan, progressDisplay, uint64(len(hosts)))
+	var workWg sync.WaitGroup
+	for _, hostObj := range hosts {
+		aiaCheck := AiaState{
+			Hostname:   hostObj.Hostname,
+			RootCAList: roots,
+			ResultChan: resultChan,
+			Weight:     hostObj.Weight,
+		}
 
-  var workWg sync.WaitGroup
-  for _, hostObj := range hosts {
-    aiaCheck := AiaState{
-      Hostname: hostObj.Hostname,
-      RootCAList: roots,
-      ResultChan: resultChan,
-      Weight: hostObj.Weight,
-    }
+		workWg.Add(1)
+		go aiaCheck.checkAndTryAia(&workWg)
+	}
 
-    workWg.Add(1)
-    go aiaCheck.checkAndTryAia(&workWg)
-  }
+	workWg.Wait()
+	close(resultChan)
 
-  workWg.Wait()
-  close(resultChan)
+	// Signal the aggregation function to print output
+	<-completeChan
 
-  // Signal the aggregation function to print output
-  <- completeChan
-
-  progressDisplay.Close()
-  progWg.Wait()
+	progressDisplay.Close()
+	progWg.Wait()
 }
