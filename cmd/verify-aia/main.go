@@ -5,17 +5,27 @@
 package main
 
 import (
+  "bufio"
   "crypto/tls"
   "crypto/x509"
   "encoding/asn1"
   "flag"
   "fmt"
-  "net/http"
   "io/ioutil"
   "log"
+  "net"
+  "net/http"
+  "os"
+  "strconv"
+  "strings"
+  "sync"
+  "time"
+
+  "github.com/jcjones/ct-sql/utils"
 )
 
 var rootsFile = flag.String("roots", "roots.pem", "Trusted root CAs in PEM format")
+var hostsFile = flag.String("hosts", "", "Hosts to test")
 
 var authorityInfoAccess = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}
 var aiaOCSP = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1}
@@ -80,9 +90,33 @@ func decodeAIA(ext []byte) (string, error) {
   return "", nil
 }
 
+type AiaOutcome int
+const (
+  SuccessViaAiaFetch AiaOutcome = iota
+  Success
+  Failure
+)
+
+type TestResult struct {
+  Result AiaOutcome
+  Weight uint64
+}
+
 type AiaState struct {
   Hostname string
   RootCAList *x509.CertPool
+  Weight uint64
+  ResultChan chan<- *TestResult
+  ResultOnce sync.Once
+}
+
+func (self *AiaState) recordResult(result AiaOutcome) {
+  self.ResultOnce.Do(func(){
+    self.ResultChan <- &TestResult{
+      Result: result,
+      Weight: self.Weight,
+    }
+  })
 }
 
 func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
@@ -92,6 +126,7 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
   for _, certAsn1 := range rawCerts {
     cert, err := x509.ParseCertificate(certAsn1)
     if err != nil {
+      self.recordResult(Failure)
       return err
     }
     if endEntity == nil {
@@ -110,7 +145,7 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 
   if err == nil {
     // Didn't need AIA fetching, so we are done
-    fmt.Println("Success")
+    self.recordResult(Success)
     return nil
   }
 
@@ -121,6 +156,7 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
     if ext.Id.Equal(authorityInfoAccess) {
       url, err := decodeAIA(ext.Value)
       if err != nil {
+        self.recordResult(Failure)
         return err
       }
 
@@ -131,25 +167,33 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
   }
 
   if aiaURL == nil {
+    self.recordResult(Failure)
     return fmt.Errorf("No AIA url, and previous error was %s", err)
   }
 
   // Fetch AIA
-  fmt.Printf("Fetching AIA: %s\n", *aiaURL)
+  // fmt.Printf("Fetching AIA: %s\n", *aiaURL)
 
-  response, err := http.Get(*aiaURL)
+  client := &http.Client{
+    Timeout: time.Second * 10,
+  }
+
+  response, err := client.Get(*aiaURL)
   if err != nil {
+    self.recordResult(Failure)
     return err
   }
 
   defer response.Body.Close()
   certBytes, err := ioutil.ReadAll(response.Body)
   if err != nil {
+    self.recordResult(Failure)
     return err
   }
 
   fetchedCert, err := x509.ParseCertificate(certBytes)
   if err != nil {
+    self.recordResult(Failure)
     return err
   }
 
@@ -162,45 +206,153 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 
   // Return whether or not the verify was successful
   if err == nil {
-    fmt.Println("Success by AIA")
+    // fmt.Println("Success by AIA")
+    self.recordResult(SuccessViaAiaFetch)
+    return nil
   }
+
+  self.recordResult(Failure)
   return err
+}
+
+func (self *AiaState) checkAndTryAia(wg *sync.WaitGroup) {
+  defer wg.Done()
+
+  dailer := &net.Dialer{
+    Timeout: time.Second * 10,
+  }
+
+  conn, err := tls.DialWithDialer(dailer, "tcp", fmt.Sprintf("%s:443", self.Hostname), &tls.Config{
+    InsecureSkipVerify: true,
+    VerifyPeerCertificate: self.checkCertificate,
+  })
+  if err == nil {
+    conn.Close()
+  } else {
+    self.recordResult(Failure)
+  }
+}
+
+type CheckHost struct {
+  Hostname string
+  Weight uint64
+}
+
+func aggregate(c <-chan *TestResult, quit chan<- bool, progressDisplay *utils.ProgressDisplay, endIdx uint64) {
+  var success uint64
+  var successW uint64
+  var failure uint64
+  var failureW uint64
+  var successViaAia uint64
+  var successViaAiaW uint64
+
+  for result := range c {
+    switch result.Result {
+    case Failure:
+      failure += 1
+      failureW += result.Weight
+    case Success:
+      success += 1
+      successW += result.Weight
+    case SuccessViaAiaFetch:
+      successViaAia += 1
+      successViaAiaW += result.Weight
+    }
+
+    progressDisplay.UpdateProgress("Checking AIA", 0, success + failure + successViaAia, endIdx)
+  }
+
+  totalCount := float64(success + failure + successViaAia)
+  totalWeight := float64(successW + failureW + successViaAiaW)
+
+  fmt.Println("Results:\n\n")
+  fmt.Printf("Success: %d (%f) W: %d (%f)\n", success, float64(success)/totalCount, successW, float64(successW)/totalWeight)
+  fmt.Printf("Success Via AIA: %d (%f) W: %d (%f)\n", successViaAia, float64(successViaAia)/totalCount, successViaAiaW, float64(successViaAiaW)/totalWeight)
+  fmt.Printf("Failure: %d (%f) W: %d (%f)\n", failure, float64(failure)/totalCount, failureW, float64(failureW)/totalWeight)
+
+  quit <- true
 }
 
 func main() {
   flag.Parse()
-  if flag.NArg() != 1 {
-    log.Fatalf("You must specify the host")
+
+  var hosts []*CheckHost
+  if (flag.NArg() == 1) {
+    hosts = append(hosts, &CheckHost{
+      Hostname: flag.Arg(0),
+      Weight: 1,
+    })
+  }
+
+  if (len(*hostsFile) > 0) {
+    f, err := os.Open(*hostsFile)
+    if err != nil {
+      log.Fatalf("Could not open hosts file: %s", err)
+      return
+    }
+
+    scanner := bufio.NewScanner(f)
+    for scanner.Scan() {
+      parts := strings.Split(scanner.Text(), " ")
+      weight, err := strconv.ParseUint(parts[1], 10, 64)
+
+      if err != nil {
+        log.Printf("Error: Could not parse number of input line %v: %s\n", parts, err)
+        continue
+      }
+
+      hosts = append(hosts, &CheckHost{
+        Hostname: parts[0],
+        Weight: weight,
+      })
+
+    }
+  }
+
+  if len(hosts) < 1 {
+    log.Fatalf("You must specify the host either as the last argument, or via -hosts")
     return
   }
 
-  hostname := flag.Arg(0)
-
-  aiaCheck := &AiaState{
-    Hostname: hostname,
-    RootCAList: x509.NewCertPool(),
-  }
-
+  roots := x509.NewCertPool()
   rootsPEM, err := ioutil.ReadFile(*rootsFile)
   if err != nil {
     panic(err)
   }
 
-  ok := aiaCheck.RootCAList.AppendCertsFromPEM([]byte(rootsPEM))
+  ok := roots.AppendCertsFromPEM([]byte(rootsPEM))
   if !ok {
     panic("Could not load root CAs from " + *rootsFile)
   }
 
-  conn, err := tls.Dial("tcp", fmt.Sprintf("%s:443", hostname), &tls.Config{
-    InsecureSkipVerify: true,
-    VerifyPeerCertificate: aiaCheck.checkCertificate,
-  })
-  if err != nil {
-    fmt.Println("Error: ", err)
-    return
-  }
-  defer conn.Close()
 
-  // state := conn.ConnectionState()
-  // log.Printf("State: %+v", state)
+  var progWg sync.WaitGroup
+  progressDisplay := utils.NewProgressDisplay()
+  progressDisplay.StartDisplay(&progWg)
+
+  completeChan := make(chan bool)
+  resultChan := make(chan *TestResult, 4)
+  go aggregate(resultChan, completeChan, progressDisplay, uint64(len(hosts)))
+
+  var workWg sync.WaitGroup
+  for _, hostObj := range hosts {
+    aiaCheck := AiaState{
+      Hostname: hostObj.Hostname,
+      RootCAList: roots,
+      ResultChan: resultChan,
+      Weight: hostObj.Weight,
+    }
+
+    workWg.Add(1)
+    go aiaCheck.checkAndTryAia(&workWg)
+  }
+
+  workWg.Wait()
+  close(resultChan)
+
+  // Signal the aggregation function to print output
+  <- completeChan
+
+  progressDisplay.Close()
+  progWg.Wait()
 }
