@@ -1,0 +1,3 @@
+example.com 100
+incomplete-chain.badssl.com 10
+self-signed.badssl.com 1

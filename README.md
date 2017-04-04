@@ -9,7 +9,7 @@ curl https://hg.mozilla.org/mozilla-central/raw-file/tip/security/nss/lib/ckfw/b
 go get github.com/agl/extract-nss-root-certs
 extract-nss-root-certs > certdata.pems
 
-go get github.com/jcjones/aia-chasercmd/verify-aia
+go get github.com/jcjones/aia-chaser/cmd/verify-aia
 verify-aia -roots certdata.pems incomplete-chain.badssl.com
 ```
 
@@ -18,26 +18,30 @@ verify-aia -roots certdata.pems incomplete-chain.badssl.com
 ```
 verify-aia -roots certdata.pems incomplete-chain.badssl.com
 verify-aia -roots certdata.pems self-signed.badssl.com
-verify-aia -roots certdata.pems badssl.com
+verify-aia -roots certdata.pems -hosts hostlist.example
 ```
+
+## Host List Input Format
+`Hostname` `Weight value`
+
+```
+example.com 100
+incomplete-chain.badssl.com 10
+self-signed.badssl.com 1
+```
+(See [hostlist.example](hostlist.example))
 
 ## Output
-
-### On Failure
-
 ```
-Error:  No AIA url, and previous error was x509: certificate signed by unknown authority
-```
+<Errors, if any>
 
-### On Success without AIA
-
-```
-Success
+Results:
+Success Count: 1 (33.333333%) Weighted Value: 100 (90.090090%)
+Success Via AIA Count: 1 (33.333333%) Weighted Value: 10 (9.009009%)
+Failure Count: 1 (33.333333%) Weighted Value: 1 (0.900901%)
 ```
 
-### On Success using AIA
-
+The absolute counts are first, followed by the weighted counts. The weighting values come
+from the input file.
 ```
-Fetching AIA: http://crt.comodoca.com/COMODORSADomainValidationSecureServerCA.crt
-Success by AIA
 ```

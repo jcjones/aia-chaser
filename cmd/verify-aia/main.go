@@ -291,10 +291,10 @@ func aggregate(c <-chan *TestResult, quit chan<- bool, progressDisplay *utils.Pr
 	totalCount := float64(success + failure + successViaAia)
 	totalWeight := float64(successW + failureW + successViaAiaW)
 
-	fmt.Println("Results:\n\n")
-	fmt.Printf("Success: %d (%f) W: %d (%f)\n", success, float64(success)/totalCount, successW, float64(successW)/totalWeight)
-	fmt.Printf("Success Via AIA: %d (%f) W: %d (%f)\n", successViaAia, float64(successViaAia)/totalCount, successViaAiaW, float64(successViaAiaW)/totalWeight)
-	fmt.Printf("Failure: %d (%f) W: %d (%f)\n", failure, float64(failure)/totalCount, failureW, float64(failureW)/totalWeight)
+	fmt.Println("\n\nResults:")
+	fmt.Printf("Success Count: %d (%f%%) Weighted Value: %d (%f%%)\n", success, float64(success)/totalCount*100, successW, float64(successW)/totalWeight*100)
+	fmt.Printf("Success Via AIA Count: %d (%f%%) Weighted Value: %d (%f%%)\n", successViaAia, float64(successViaAia)/totalCount*100, successViaAiaW, float64(successViaAiaW)/totalWeight*100)
+	fmt.Printf("Failure Count: %d (%f%%) Weighted Value: %d (%f%%)\n", failure, float64(failure)/totalCount*100, failureW, float64(failureW)/totalWeight*100)
 
 	quit <- true
 }
