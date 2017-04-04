@@ -1,4 +1,4 @@
-# Check whether AIA fetching is necessary for a host
+# Analyze how many hosts in a list require AIA fetching to load
 
 Requires Go 1.8
 
@@ -43,5 +43,3 @@ Failure Count: 1 (33.333333%) Weighted Value: 1 (0.900901%)
 
 The absolute counts are first, followed by the weighted counts. The weighting values come
 from the input file.
-```
-```
