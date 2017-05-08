@@ -31,68 +31,12 @@ var rootsFile = flag.String("roots", "roots.pem", "Trusted root CAs in PEM forma
 var hostsFile = flag.String("hosts", "", "Hosts to test")
 var numThreads = flag.Int("threads", 8, "Number of threads per core to use")
 
-
 var authorityInfoAccess = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}
 var aiaOCSP = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1}
 var aiaIssuer = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 2}
 
 func decodeCert(cert *x509.Certificate) string {
 	return fmt.Sprintf("%+v %+v", cert.Subject, cert.Extensions)
-}
-
-func decodeAIA(ext []byte) (string, error) {
-	var seq asn1.RawValue
-	rest, err := asn1.Unmarshal(ext, &seq)
-	if err != nil {
-		return "", fmt.Errorf("Error unmarshaling %s", err)
-	} else if len(rest) != 0 {
-		return "", fmt.Errorf("x509: trailing data after X.509 extension")
-	}
-
-	if !seq.IsCompound || seq.Tag != 16 || seq.Class != 0 {
-		return "", asn1.StructuralError{Msg: "bad SAN sequence"}
-	}
-
-	rest = seq.Bytes
-
-	for len(rest) > 0 {
-		var inside asn1.RawValue
-		rest, err = asn1.Unmarshal(rest, &inside)
-		if err != nil {
-			return "", fmt.Errorf("Error unmarshaling %s", err)
-		}
-
-		if !inside.IsCompound || inside.Tag != 16 || inside.Class != 0 {
-			return "", asn1.StructuralError{Msg: "bad SAN sequence"}
-		}
-
-		var oidValue asn1.ObjectIdentifier
-		body, err := asn1.Unmarshal(inside.Bytes, &oidValue)
-		if err != nil {
-			return "", fmt.Errorf("Error unmarshaling %s", err)
-		}
-
-		var extensionData asn1.RawValue
-		rest, err := asn1.Unmarshal(body, &extensionData)
-		if err != nil {
-			return "", fmt.Errorf("Error unmarshaling %s", err)
-		} else if len(rest) != 0 {
-			return "", fmt.Errorf("x509: trailing data after AIA extension")
-		}
-
-		if oidValue.Equal(aiaIssuer) {
-			switch extensionData.Tag {
-			case 6:
-				return string(extensionData.Bytes), nil
-			default:
-				return "", fmt.Errorf("Unknown type for AIA Issuer extension: %+v", extensionData)
-			}
-		}
-
-	}
-
-	// No AIA Issuer extension values
-	return "", nil
 }
 
 type AiaOutcome string
@@ -161,56 +105,45 @@ func (self *AiaState) checkCertificate(rawCerts [][]byte, verifiedChains [][]*x5
 		return nil
 	}
 
-	// If not, let's find an AIA extension
-	var aiaURL *string
-
-	for _, ext := range endEntity.Extensions {
-		if ext.Id.Equal(authorityInfoAccess) {
-			url, err := decodeAIA(ext.Value)
-			if err != nil {
-				self.recordResult(Failure, err)
-				return err
-			}
-
-			if len(url) > 0 {
-				aiaURL = &url
-			}
-		}
+	foundAIA := false
+	client := &http.Client{
+		Timeout: timeout,
 	}
 
-	if aiaURL == nil {
+	for _, aiaURL := range endEntity.IssuingCertificateURL {
+		if !strings.HasPrefix(aiaURL, "http") {
+			continue
+		}
+		foundAIA = true
+		// Fetch AIA
+		response, err := client.Get(aiaURL)
+		if err != nil {
+			self.recordResult(Failure, err)
+			return err
+		}
+
+		defer response.Body.Close()
+		certBytes, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			self.recordResult(Failure, err)
+			return err
+		}
+
+		fetchedCert, err := x509.ParseCertificate(certBytes)
+		if err != nil {
+			self.recordResult(Failure, err)
+			return err
+		}
+
+		intermediates.AddCert(fetchedCert)
+	}
+
+	if !foundAIA {
 		err = fmt.Errorf("No AIA url, and previous error was %s", err)
 		self.recordResult(Failure, err)
 		return err
 	}
 
-	// Fetch AIA
-	// fmt.Printf("Fetching AIA: %s\n", *aiaURL)
-
-	client := &http.Client{
-		Timeout: timeout,
-	}
-
-	response, err := client.Get(*aiaURL)
-	if err != nil {
-		self.recordResult(Failure, err)
-		return err
-	}
-
-	defer response.Body.Close()
-	certBytes, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		self.recordResult(Failure, err)
-		return err
-	}
-
-	fetchedCert, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		self.recordResult(Failure, err)
-		return err
-	}
-
-	intermediates.AddCert(fetchedCert)
 	_, err = endEntity.Verify(x509.VerifyOptions{
 		DNSName:       self.Hostname,
 		Intermediates: intermediates,
@@ -368,7 +301,7 @@ func main() {
 	var workWg sync.WaitGroup
 	inputChan := make(chan *AiaState, 4)
 
-	for i := 0; i < *numThreads * runtime.NumCPU(); i++ {
+	for i := 0; i < *numThreads*runtime.NumCPU(); i++ {
 		go processInput(inputChan, &workWg)
 	}
 
